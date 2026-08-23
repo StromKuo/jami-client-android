@@ -270,14 +270,12 @@ class HomeActivity : FragmentActivity() {
             mCamera = null
             preview.surfaceTextureListener = null
             mPreviewView.removeAllViews()
-            Schedulers.io().scheduleDirect {
-                try {
-                    camera?.setPreviewCallback(null)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error removing camera preview", e)
-                }
-                preview.stop()
+            try {
+                camera?.setPreviewCallback(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error removing camera preview", e)
             }
+            preview.stop()
         }
         mDisposableBag.clear()
     }
@@ -384,9 +382,8 @@ class HomeActivity : FragmentActivity() {
             camera.apply {
                 val params = parameters
                 Log.w(TAG, "setUpCamera() supportedPictureSizes: ${params.previewSize.width}, x: ${params.previewSize.height}")
-                val selectSize = chooseOptimalSize(params.supportedPictureSizes, 1280, 720, 1920, 1080, TARGET_SIZE)
+                val selectSize = chooseOptimalSize(params.supportedPreviewSizes, 1280, 720, 1920, 1080, TARGET_SIZE)
                 Log.w(TAG, "setUpCamera() selectSize: ${selectSize.width}, x: ${selectSize.height}")
-                params.setPictureSize(selectSize.width, selectSize.height)
                 params.setPreviewSize(selectSize.width, selectSize.height)
                 setErrorCallback(mErrorCallback)
                 try {

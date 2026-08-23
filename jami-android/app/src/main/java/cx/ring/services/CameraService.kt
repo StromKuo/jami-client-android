@@ -23,6 +23,7 @@ import android.hardware.camera2.CameraCaptureSession.CaptureCallback
 import android.hardware.camera2.CameraManager.AvailabilityCallback
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.*
@@ -385,6 +386,15 @@ class CameraService internal constructor(c: Context) {
                 camera.close()
                 params.camera = null
             }
+            releaseCodec(params)
+            params.previewSurface?.let { surface ->
+                try {
+                    surface.release()
+                } catch (_: Exception) {
+                }
+            }
+            params.previewSurface = null
+            params.captureSurface = null
             params.projection?.let { mediaProjection ->
                 // delay the media projection stop call to avoid destroying the screen capture
                 // for cases where media sources in the daemon are re-initialized
@@ -399,6 +409,37 @@ class CameraService internal constructor(c: Context) {
             }
             params.isCapturing = false
         }
+    }
+
+    /**
+     * Release a camera-input codec regardless of whether it reached Executing.
+     * Camera surfaces can be destroyed before the first frame is captured, so
+     * signalEndOfInputStream/stop are not always legal states.
+     */
+    private fun releaseCodec(params: VideoParams) {
+        params.mediaCodec?.let { codec ->
+            if (params.codecStarted) {
+                try {
+                    codec.signalEndOfInputStream()
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "Codec was not executing while stopping", e)
+                }
+                try {
+                    codec.stop()
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "Codec could not be stopped cleanly", e)
+                }
+            }
+            try {
+                codec.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error releasing codec", e)
+            }
+        }
+        params.mediaCodec = null
+        params.codecStarted = false
+        params.codecData = null
+        params.forceKeyFrame = false
     }
 
     private fun openEncoder(
@@ -430,9 +471,6 @@ class CameraService internal constructor(c: Context) {
         var codec: MediaCodec? = null
         try {
             codec = MediaCodec.createByCodecName(codecName)
-            val params = Bundle()
-            params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bitrateValue)
-            codec.setParameters(params)
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoderInput = /*surface?.also { codec!!.setInputSurface(it) } ?:*/ codec.createInputSurface()
             val callback: MediaCodec.Callback = object : MediaCodec.Callback() {
@@ -511,6 +549,31 @@ class CameraService internal constructor(c: Context) {
             }
         }
         return Pair(codec, encoderInput)
+    }
+
+    /**
+     * Return smaller camera output sizes with the same aspect ratio as the
+     * requested size. Some Android TV camera HALs advertise a 720p YUV stream
+     * but produce no buffers for it when another surface is active. Keeping
+     * the fallback list tied to the camera's advertised YUV sizes avoids
+     * selecting a resolution which the camera cannot actually configure.
+     */
+    private fun smallerCameraOutputSizes(
+        streamConfigs: StreamConfigurationMap?,
+        current: Size
+    ): List<Size> {
+        val currentRatio = current.width.toFloat() / current.height.toFloat()
+        return streamConfigs?.getOutputSizes(ImageFormat.YUV_420_888)
+            ?.filter { size ->
+                val ratio = size.width.toFloat() / size.height.toFloat()
+                size.surface() < current.surface()
+                    && size.width <= current.width
+                    && size.height <= current.height
+                    && abs(ratio - currentRatio) < 0.02f
+            }
+            ?.distinct()
+            ?.sortedByDescending { it.surface() }
+            ?: emptyList()
     }
 
     fun requestKeyFrame(camId: String) {
@@ -788,30 +851,44 @@ class CameraService internal constructor(c: Context) {
         //previewCamera?.close()
         val handler = videoHandler
         try {
+            if (videoParams.isCapturing &&
+                (videoParams.camera != null || videoParams.cameraSession != null || videoParams.mediaCodec != null)) {
+                Log.w(TAG, "Ignoring duplicate camera open for ${videoParams.id}")
+                return
+            }
             val view =  surface as AutoFitTextureView
             val flip = videoParams.rotation % 180 != 0
             val cc = manager!!.getCameraCharacteristics(videoParams.id)
             val fpsRange = chooseOptimalFpsRange(cc.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES))
             val streamConfigs = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val previewSize = chooseOptimalSize(
-                streamConfigs?.getOutputSizes(SurfaceHolder::class.java),
-                if (flip) view.height else view.width, if (flip) view.width else view.height,
-                videoParams.size.width, videoParams.size.height,
-                videoParams.size
-            )
-            Log.d(TAG, "Selected preview size: " + previewSize + ", fps range: " + fpsRange + " rate: " + videoParams.rate)
-            view.setAspectRatio(previewSize.height, previewSize.width)
-            val texture = view.surfaceTexture ?: throw IllegalStateException()
-            texture.setDefaultBufferSize(previewSize.width, previewSize.height)
-            val previewSurface = Surface(texture)
             var tmpReader: ImageReader? = null
             var codec: Pair<MediaCodec?, Surface?> = Pair(null, null)
             var captureSurface: Surface? = null
             if (!videoPreview) {
-                codec = if (hw_accel)
-                    openEncoder(
-                        videoParams, videoParams.getAndroidCodec(), handler, resolution, bitrate)
-                else Pair(null, null)
+                if (hw_accel) {
+                    val requestedSize = videoParams.size
+                    val candidateSizes = listOf(requestedSize) + smallerCameraOutputSizes(streamConfigs, requestedSize)
+                    var selectedEncoderSize = requestedSize
+                    for (candidateSize in candidateSizes) {
+                        videoParams.size = candidateSize
+                        Log.d(TAG, "Trying camera encoder size: $candidateSize")
+                        codec = openEncoder(
+                            videoParams, videoParams.getAndroidCodec(), handler, resolution, bitrate)
+                        if (codec.second != null) {
+                            selectedEncoderSize = candidateSize
+                            break
+                        }
+                    }
+                    if (codec.second == null) {
+                        // Keep the largest lower resolution for the ImageReader
+                        // fallback instead of accidentally ending on the
+                        // smallest candidate after all encoder attempts fail.
+                        videoParams.size = candidateSizes.getOrNull(1) ?: requestedSize
+                        Log.w(TAG, "Hardware encoder unavailable; using YUV camera size ${videoParams.size}")
+                    } else if (selectedEncoderSize != requestedSize) {
+                        Log.w(TAG, "Hardware encoder fallback selected camera size $selectedEncoderSize")
+                    }
+                }
 
                 if (codec.second != null) {
                     videoParams.mediaCodec = codec.first
@@ -820,7 +897,7 @@ class CameraService internal constructor(c: Context) {
                         videoParams.size.width,
                         videoParams.size.height,
                         ImageFormat.YUV_420_888,
-                        8
+                        4
                     )
                     tmpReader.setOnImageAvailableListener(
                         OnImageAvailableListener { r: ImageReader ->
@@ -837,6 +914,17 @@ class CameraService internal constructor(c: Context) {
                 }
                 captureSurface = codec.second ?: tmpReader?.surface
             }
+            val previewSize = chooseOptimalSize(
+                streamConfigs?.getOutputSizes(SurfaceHolder::class.java),
+                if (flip) view.height else view.width, if (flip) view.width else view.height,
+                videoParams.size.width, videoParams.size.height,
+                videoParams.size
+            )
+            Log.d(TAG, "Selected preview size: " + previewSize + ", capture size: " + videoParams.size + ", fps range: " + fpsRange + " rate: " + videoParams.rate)
+            view.setAspectRatio(previewSize.height, previewSize.width)
+            val texture = view.surfaceTexture ?: throw IllegalStateException()
+            texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            val previewSurface = Surface(texture)
             val camera = videoParams.camera
             if (videoParams.isCapturing && camera != null) {
                 createCameraSession(camera, previewSurface, captureSurface, codec.first,
@@ -871,16 +959,12 @@ class CameraService internal constructor(c: Context) {
                     override fun onClosed(camera: CameraDevice) {
                         Log.w(TAG, "onClosed")
                         try {
-                            videoParams.mediaCodec?.let { mediaCodec ->
-                                if (videoParams.codecStarted)
-                                    mediaCodec.signalEndOfInputStream()
-                                mediaCodec.release()
-                                videoParams.mediaCodec = null
-                                videoParams.codecStarted = false
-                            }
+                            releaseCodec(videoParams)
                             codec?.second?.release()
                             tmpReader?.close()
                             previewSurface.release()
+                            videoParams.previewSurface = null
+                            videoParams.captureSurface = null
                         } catch (e: Exception) {
                             Log.w(TAG, "Error stopping codec", e)
                         }

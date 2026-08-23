@@ -890,6 +890,13 @@ class HardwareServiceImpl(
     }
 
     override fun removePreviewVideoSurface() {
+        // TVCallFragment can recreate its TextureView while the call is still
+        // active. Release the old Camera2 session/encoder before the new
+        // surface causes startCapture() to open another codec instance.
+        mPreviewCamId?.let { camId ->
+            pendingStartCodec.remove(camId)
+            cameraService.closeCamera(camId)
+        }
         mCameraPreviewSurface.clear()
     }
 
