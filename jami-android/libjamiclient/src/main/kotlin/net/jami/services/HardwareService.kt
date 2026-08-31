@@ -78,6 +78,8 @@ abstract class HardwareService(
     // camera so the daemon applies the new resolution without an app restart.
     abstract fun onVideoResolutionChanged()
     abstract val isVideoAvailable: Boolean
+    /** Request access to an attached USB UAC microphone from a foreground UI. */
+    abstract fun requestUsbUacPermission()
     abstract fun updateAudioState(conf: Conference?, call: Call, incomingCall: Boolean, isOngoingVideo: Boolean)
     abstract fun closeAudioState()
     abstract fun isSpeakerphoneOn(): Boolean

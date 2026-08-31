@@ -76,6 +76,7 @@ class HardwareServiceImpl(
 ) : HardwareService(executor, preferenceService, uiScheduler), OnAudioFocusChangeListener, BluetoothChangeListener {
     private val videoInputs: MutableMap<String, Shm> = HashMap()
     private val cameraService = CameraService(context)
+    private val usbUacMicrophone = UsbUacMicrophone(context)
     private val mAudioManager: AudioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var mBluetoothWrapper: BluetoothWrapper? = null
     private var currentFocus: AudioFocusRequestCompat? = null
@@ -124,6 +125,12 @@ class HardwareServiceImpl(
         get() = cameraService.maxResolutions
     override val isVideoAvailable: Boolean
         get() = context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) || cameraService.hasCamera()
+
+    override fun requestUsbUacPermission() {
+        // This method is called by the visible TV activity. Do not start audio
+        // capture here; only complete the one-time USB host authorization.
+        usbUacMicrophone.requestPermission()
+    }
 
     override fun hasMicrophone(): Boolean {
         if (context.packageManager.hasSystemFeature(PackageManager.FEATURE_MICROPHONE))
@@ -182,6 +189,23 @@ class HardwareServiceImpl(
         if (request != null && AudioManagerCompat.requestAudioFocus(mAudioManager, request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
             currentFocus = request
         }
+    }
+
+    @SuppressLint("NewApi")
+    private fun configureAudioInput() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+
+        val inputs = mAudioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        val usbInput = inputs.firstOrNull { device ->
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        }
+        val selectedId = usbInput?.id ?: -1
+        val devices = inputs.joinToString { device ->
+            "${device.id}:${device.type}:${device.productName ?: ""}"
+        }
+        Log.w(TAG, "Audio inputs [$devices], selected USB input id=$selectedId")
+        JamiService.setPreferredInputDevice(selectedId)
     }
 
     @SuppressLint("NewApi")
@@ -296,6 +320,20 @@ class HardwareServiceImpl(
     @Synchronized
     override fun updateAudioState(conf: Conference?, call: Call, incomingCall: Boolean, isOngoingVideo: Boolean) {
         Log.d(TAG, "updateAudioState $conf: Call state updated to ${call.callStatus} Call is incoming: $incomingCall Call is video: $isOngoingVideo")
+        if (call.callStatus == CallStatus.CURRENT) {
+            // A USB camera may expose a separate USB audio input. Select it
+            // before the native capture stream is started; AAudio otherwise
+            // keeps using the TV's default input device.
+            configureAudioInput()
+        }
+        // Do not start the USB stream during ringing. The audio layer tears
+        // down the ringtone stream before the call becomes current; starting
+        // UAC here could therefore leave the Java side believing it is active
+        // while native capture has already been stopped.
+        if (call.callStatus == CallStatus.CURRENT)
+            usbUacMicrophone.start()
+        else if (call.callStatus.isOver)
+            usbUacMicrophone.stop()
         disposables.add(call.systemConnection.map {
                 (it as CallServiceImpl.AndroidCall).connection!!
             }
@@ -347,6 +385,7 @@ class HardwareServiceImpl(
 
     @Synchronized
     override fun closeAudioState() {
+        usbUacMicrophone.stop()
         if (mIsOutputMuted) setOutputMuted(false)
         abandonAudioFocus()
     }

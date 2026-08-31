@@ -97,6 +97,7 @@ class HomeActivity : FragmentActivity() {
     private var mBlurOut: Allocation? = null
     private var cameraPermissionIsRefusedFlag = false // to not ask for permission again if refused
     private var paused = false
+    private var usbPermissionPrompted = false
     private var renderEffect: RenderEffect? = null
     private var wizardLaunched = false
 
@@ -259,6 +260,23 @@ class HomeActivity : FragmentActivity() {
         super.onPostResume()
         paused = false
         checkCameraAvailability()
+        requestUsbPermissionIfFocused()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus)
+            requestUsbPermissionIfFocused()
+    }
+
+    private fun requestUsbPermissionIfFocused() {
+        // USB host permission is a device-specific SystemUI dialog, not a
+        // runtime permission shown in App settings. Request it after Home has
+        // a window and focus so TV SystemUI keeps the dialog visible.
+        if (usbPermissionPrompted || isFinishing || isDestroyed || !hasWindowFocus()) return
+        usbPermissionPrompted = true
+        Log.i(TAG, "Requesting StreamCam USB permission from foreground HomeActivity")
+        mHardwareService.requestUsbUacPermission()
     }
 
     override fun onPause() {
@@ -425,11 +443,11 @@ class HomeActivity : FragmentActivity() {
     }
 
     private fun checkCameraAvailability() {
-        if (mDeviceRuntimeService.hasVideoPermission()) {
-            setUpCamera()
-        } else {
-            if (!cameraPermissionIsRefusedFlag) askCameraPermission()
-        }
+        // The home-screen blur used the legacy Camera1 API. TVCallActivity
+        // owns the same USB camera through Camera2, so opening Camera1 here
+        // races with calls and can evict the active call camera. The call UI
+        // requests camera permission and opens the camera when needed.
+        Log.i(TAG, "Skipping legacy Camera1 home preview; call UI owns the camera")
     }
 
     private fun askCameraPermission() {

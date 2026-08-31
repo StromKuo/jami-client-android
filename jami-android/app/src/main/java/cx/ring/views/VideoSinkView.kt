@@ -25,6 +25,7 @@ import android.util.Size
 import android.view.Surface
 import kotlin.jvm.JvmOverloads
 import android.view.TextureView
+import android.os.SystemClock
 import androidx.core.view.doOnPreDraw
 import androidx.core.view.isVisible
 import cx.ring.R
@@ -47,6 +48,8 @@ class VideoSinkView @JvmOverloads constructor(context: Context, attrs: Attribute
     private var nativeWindow: Long = -1
     private var surface: Surface? = null
     private var fitToContent: Boolean = true
+    private var surfaceUpdateCount = 0L
+    private var lastSurfaceStatsMs = 0L
 
     var videoListener: (Boolean) -> Unit = {}
 
@@ -128,11 +131,17 @@ class VideoSinkView @JvmOverloads constructor(context: Context, attrs: Attribute
         if (nw != -1L) {
             disposableBag.add(hardwareService!!.connectSink(id, nw)
                 .observeOn(DeviceUtils.uiScheduler)
-                .subscribe { size -> setAspectRatio(size.first, size.second) })
+                .subscribe { size ->
+                    Log.i(TAG, "connectSink size sink=$id size=${size.first}x${size.second} nativeWindow=$nw")
+                    setAspectRatio(size.first, size.second)
+                })
         } else {
             disposableBag.add(hardwareService!!.getSinkSize(id)
                 .observeOn(DeviceUtils.uiScheduler)
-                .subscribe { c -> setAspectRatio(c.first, c.second) })
+                .subscribe { c ->
+                    Log.i(TAG, "getSinkSize sink=$id size=${c.first}x${c.second}")
+                    setAspectRatio(c.first, c.second)
+                })
         }
     }
 
@@ -172,9 +181,11 @@ class VideoSinkView @JvmOverloads constructor(context: Context, attrs: Attribute
     }
 
     override fun onSurfaceTextureAvailable(s: SurfaceTexture, width: Int, height: Int) {
+        Log.i(TAG, "onSurfaceTextureAvailable sink=$sinkId view=${width}x$height")
         if (surface == null) {
             surface = Surface(s)
             nativeWindow = JamiServiceJNI.acquireNativeWindow(surface)
+            Log.i(TAG, "native window acquired sink=$sinkId window=$nativeWindow geometry=${ratioWidth}x$ratioHeight")
             JamiServiceJNI.setNativeWindowGeometry(nativeWindow, ratioWidth, ratioHeight)
             configureTransform(ratioWidth, ratioHeight)
         }
@@ -182,6 +193,7 @@ class VideoSinkView @JvmOverloads constructor(context: Context, attrs: Attribute
     }
 
     override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, width: Int, height: Int) {
+        Log.i(TAG, "onSurfaceTextureSizeChanged sink=$sinkId view=${width}x$height ratio=${ratioWidth}x$ratioHeight window=$nativeWindow")
         configureTransform(ratioWidth, ratioHeight)
         if (surface != null) {
             JamiServiceJNI.setNativeWindowGeometry(nativeWindow, ratioWidth, ratioHeight)
@@ -189,6 +201,7 @@ class VideoSinkView @JvmOverloads constructor(context: Context, attrs: Attribute
     }
 
     override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+        Log.i(TAG, "onSurfaceTextureDestroyed sink=$sinkId window=$nativeWindow updates=$surfaceUpdateCount")
         stopSink()
         surface?.let { s ->
             JamiServiceJNI.releaseNativeWindow(nativeWindow)
@@ -201,6 +214,15 @@ class VideoSinkView @JvmOverloads constructor(context: Context, attrs: Attribute
     }
 
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        ++surfaceUpdateCount
+        val now = SystemClock.elapsedRealtime()
+        if (lastSurfaceStatsMs == 0L)
+            lastSurfaceStatsMs = now
+        if (now - lastSurfaceStatsMs >= 1000L) {
+            Log.i(TAG, "[SurfaceTextureStats] sink=$sinkId updates=$surfaceUpdateCount fps=${surfaceUpdateCount * 1000.0 / (now - lastSurfaceStatsMs)} window=$nativeWindow size=${ratioWidth}x$ratioHeight")
+            surfaceUpdateCount = 0L
+            lastSurfaceStatsMs = now
+        }
     }
 
     companion object {
